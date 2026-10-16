@@ -3,6 +3,57 @@ const $ = id => document.getElementById(id);
 let mode = 'demo', stream = null, imageUrl = null, checks = 0, notes = 0;
 let cameraRequest = 0, uploadRequest = 0, demoTimer = null, demoStep = 0;
 let demoElapsed = 0, demoLastFrame = null;
+let personX = 250, personY = 0, litter = null, disposed = false;
+const wasteTypes = [
+  {id: 'paper', name: 'Giấy'},
+  {id: 'bottle', name: 'Chai nhựa'},
+  {id: 'bag', name: 'Bao ni lông'},
+  {id: 'can', name: 'Lon'}
+];
+const randomWaste = () => wasteTypes[Math.floor(Math.random() * wasteTypes.length)];
+let playerWaste = wasteTypes[0], heldWaste = [playerWaste];
+let lastNpcDrop = -15000;
+function showWaste(id, type) {
+  const element = $(id);
+  const href = `#waste-${type.id}`;
+  if (element.getAttribute('href') !== href) element.setAttribute('href', href);
+}
+const movementKeys = new Set();
+let npcs = [], npcLitter = [], npcDrops = 0;
+function spawnNpc(i, previousSide) {
+  const side = previousSide === undefined ? i % 2 : 1 - previousSide;
+  const carrying = Math.random() < 0.5;
+  const willDrop = carrying && Math.random() < 0.5;
+  return {side, x: side ? 870 : -70, y: [-95, -20, 55][i],
+    wait: previousSide === undefined ? i * 4500 : 1500 + Math.random() * 4000,
+    speed: 40 + Math.random() * 18, waste: randomWaste(), carrying,
+    willDrop, dropped: false, dropX: 200 + Math.random() * 380};
+}
+function resetNpcs() {
+  npcs = [0, 1, 2].map(i => spawnNpc(i));
+  npcLitter = [];
+  npcDrops = 0;
+  lastNpcDrop = -15000;
+}
+function advanceNpcs(delta) {
+  npcs.forEach((npc, i) => {
+    if (npc.wait > 0) { npc.wait -= delta; return; }
+    const nextX = npc.x + (npc.side ? -1 : 1) * npc.speed * delta / 1000;
+    const blocks = [{x: personX, y: personY}, ...npcs.filter(other => other !== npc)];
+    const blocked = blocks.some(other => Math.abs(npc.y - other.y) < 40 && Math.abs(nextX - other.x) < 85 && Math.abs(nextX - other.x) < Math.abs(npc.x - other.x));
+    npc.walking = !blocked;
+    if (!blocked) npc.x = nextX;
+    if (npc.carrying && npc.willDrop && demoElapsed - lastNpcDrop >= 15000 && npcLitter.length < 18 && (npc.side ? npc.x <= npc.dropX : npc.x >= npc.dropX)) {
+      npc.carrying = false;
+      npc.dropped = true;
+      npcDrops++;
+      lastNpcDrop = demoElapsed;
+      npcLitter.push({x: npc.x + 24, y: npc.y + 345, type: npc.waste});
+    }
+    if (npc.side ? npc.x < -70 : npc.x > 870) npcs[i] = spawnNpc(i, npc.side);
+  });
+}
+const demoHint = 'Bấm Chạy demo, dùng WASD hoặc phím mũi tên để di chuyển. Space: nhặt rác ở gần / thả một vật khi không có rác gần. O: bỏ rác đang cầm vào thùng khi đứng gần. Cầm tối đa 2 món, mỗi tay một món.';
 let events = [];
 const now = () => new Date().toLocaleString('vi-VN');
 function toast(message) {
@@ -38,6 +89,7 @@ function releaseImage() {
   $('uploadedImage').hidden = true;
 }
 function pauseDemo() {
+  movementKeys.clear();
   cancelAnimationFrame(demoTimer);
   demoLastFrame = null;
   demoTimer = null;
@@ -48,13 +100,22 @@ function resetDemo() {
   pauseDemo();
   demoStep = 0;
   demoElapsed = 0;
-  $('demoPerson').setAttribute('opacity', '0');
+  personX = 250;
+  personY = 0;
+  litter = null;
+  disposed = false;
+  playerWaste = randomWaste();
+  heldWaste = [playerWaste];
+  resetNpcs();
+  $('demoPerson').setAttribute('opacity', '1');
   $('demoPerson').setAttribute('transform', 'translate(250 0)');
   $('personBox').toggleAttribute('hidden', true);
   $('behaviorAlert').hidden = true;
   $('playDemo').textContent = '▶ Chạy demo';
   $('sampleObject').setAttribute('opacity', '0');
   $('demoBox').toggleAttribute('hidden', true);
+  $('demoBox').removeAttribute('transform');
+  renderDemo();
   document.querySelectorAll('.steps li').forEach(el => el.classList.remove('active'));
   if (mode === 'demo') result('Chưa có kết quả nhận diện', 'Chạy demo để xem quy trình dự kiến. Mọi bước trong demo đều là minh họa.', 'Sẵn sàng chạy minh họa');
 }
@@ -71,6 +132,7 @@ function setMode(next) {
   $('demoTab').setAttribute('aria-pressed', String(demo));
   $('liveTab').setAttribute('aria-pressed', String(!demo));
   $('demoScene').hidden = !demo;
+  $('npcSummary').hidden = !demo;
   $('placeholder').hidden = demo;
   $('demoControls').hidden = !demo;
   $('liveControls').hidden = demo;
@@ -78,58 +140,161 @@ function setMode(next) {
   $('sourceLabel').textContent = demo ? 'DỮ LIỆU MINH HỌA' : 'XEM TRƯỚC · CHƯA PHÂN TÍCH AI';
   $('clock').textContent = demo ? 'SÂN TRƯỜNG · MÔ PHỎNG' : 'CHƯA KẾT NỐI CAMERA';
   $('feedNote').textContent = demo ? 'MINH HỌA QUY TRÌNH / KHÔNG NHẬN DIỆN THỰC TẾ' : 'HÌNH ẢNH CHỈ HIỂN THỊ TRÊN TRÌNH DUYỆT · CHƯA CÓ AI';
-  $('controlHint').textContent = demo ? 'Một người đi qua → thả rác → phát hiện hành vi xả rác (mô phỏng).' : 'Camera cần quyền truy cập và kết nối HTTPS. Ảnh không được gửi đến máy chủ.';
+  $('controlHint').textContent = demo ? demoHint : 'Camera cần quyền truy cập và kết nối HTTPS. Ảnh không được gửi đến máy chủ.';
   $('resultKind').textContent = demo ? 'TRẠNG THÁI TRẢI NGHIỆM' : 'TRẠNG THÁI NGUỒN HÌNH ẢNH';
   result('Chưa có kết quả nhận diện', demo ? 'Chạy demo để xem quy trình dự kiến. Mọi bước trong demo đều là minh họa.' : 'Bật webcam hoặc tải ảnh để xem trước. Mô hình AI chưa được tích hợp.', demo ? 'Sẵn sàng chạy minh họa' : 'Camera chưa khởi động');
 }
 function renderDemo() {
-  const t = demoElapsed / 1000;
-  const x = t < 4 ? 250 + t * 45 : t < 6 ? 430 : 430 + Math.min(t - 6, 4) * 37;
   $('demoPerson').setAttribute('opacity', '1');
-  $('demoPerson').setAttribute('transform', `translate(${x} 0)`);
+  $('demoPerson').setAttribute('transform', `translate(${personX} ${personY})`);
   $('personBox').toggleAttribute('hidden', false);
-  const walking = t < 4 || t > 6;
-  const stride = walking ? Math.sin(t * 9) * 12 : 0;
+  const stride = movementKeys.size ? Math.sin(demoElapsed / 110) * 12 : 0;
   $('personLegs').setAttribute('d', `M-8 302L${-8 + stride} 341M8 302L${8 - stride} 341`);
-  $('personArm').setAttribute('d', t >= 4 && t < 6 ? 'M12 263L34 277' : 'M12 263L25 290');
-  $('sampleObject').setAttribute('opacity', '1');
-  // The litter stays in the person's hand, then falls to the ground.
-  const fall = Math.max(0, Math.min(1, (t - 4.5) / 1.1));
-  $('sampleObject').setAttribute('transform', t < 4.5 ? `translate(${x + 30} 277)` : `translate(460 ${277 + fall * 68}) rotate(${fall * 25})`);
-  $('demoBox').toggleAttribute('hidden', t < 5.6);
-  $('behaviorAlert').hidden = t < 6.2;
-  const step = t < 4.5 ? 1 : t < 6.2 ? 2 : 3;
-  if (step !== demoStep) {
-    demoStep = step;
-    document.querySelectorAll('.steps li').forEach((el, i) => el.classList.toggle('active', i === step - 1));
-    if (step === 1) result('01 / Nhận diện người', 'Một người đang đi qua sân trường, cầm rác trên tay. Khung xanh theo dõi người trong demo.', 'Mô phỏng · Đang theo dõi người');
-    if (step === 2) result('02 / Người thả rác', 'Rác rơi khỏi tay và nằm trên sân. Camera minh họa đồng thời theo dõi người và vị trí rác.', 'Mô phỏng · Người đang thả rác');
-    if (step === 3) result('03 / Phát hiện hành vi xả rác', 'Người rời đi, rác còn trên sân. Demo liên kết chuyển động thả rác với người đang được theo dõi.', 'Mô phỏng · Phát hiện xả rác');
-    $('objectText').textContent = step === 1 ? '1 người · cầm rác' : '1 người + 1 vật thể rác';
-    $('confidenceText').textContent = 'Không áp dụng (mô phỏng)';
-    $('timeText').textContent = 'Kịch bản minh họa';
-    document.querySelector('.result-card').classList.toggle('is-alert', step === 3);
+  $('personArm').setAttribute('d', litter || disposed ? 'M12 263L25 290' : 'M12 263L30 277');
+  $('sampleObject').setAttribute('opacity', disposed ? '0' : '1');
+  if (heldWaste[0]) showWaste('playerWasteGraphic', heldWaste[0]);
+  $('secondHeldObject').setAttribute('opacity', heldWaste[1] ? '1' : '0');
+  if (heldWaste[1]) showWaste('secondHeldGraphic', heldWaste[1]);
+  $('personLeftArm').setAttribute('d', heldWaste[1] ? 'M-12 264L-30 277' : 'M-12 264L-22 295');
+  $('playerWasteLabel').textContent = playerWaste.name;
+  $('sampleObject').setAttribute('transform', 'translate(30 277)');
+  $('demoBox').toggleAttribute('hidden', !litter);
+  if (litter) $('demoBox').setAttribute('transform', `translate(${litter.x - 460} ${litter.y - 345})`);
+  $('behaviorAlert').hidden = !litter;
+  $('binPrompt').setAttribute('opacity', !litter && !disposed && nearBin() ? '1' : '0');
+  npcs.forEach((npc, i) => {
+    const stride = npc.walking ? Math.sin(demoElapsed / 125 + i * 2) * 10 : 0;
+    $(`npc${i}`).setAttribute('transform', `translate(${npc.x} ${npc.y})`);
+    $(`npcLegs${i}`).setAttribute('d', `M-8 302L${-8 + stride} 341M8 302L${8 - stride} 341`);
+    $(`npcHeld${i}`).setAttribute('opacity', npc.carrying ? '1' : '0');
+    $(`npcLabel${i}`).textContent = `Người · 0${i + 2}`;
+    showWaste(`npcHeldGraphic${i}`, npc.waste);
+    $(`npcTracking${i}`).setAttribute('stroke', npc.dropped ? '#a55825' : '#23664a');
+  });
+  for (let i = 0; i < 18; i++) {
+    const item = npcLitter[i];
+    $(`npcWaste${i}`).setAttribute('opacity', item ? '1' : '0');
+    if (item) {
+      $(`npcWaste${i}`).setAttribute('transform', `translate(${item.x} ${item.y})`);
+      $(`npcWasteLabel${i}`).textContent = item.type.name;
+      showWaste(`npcWasteGraphic${i}`, item.type);
+    }
   }
+  const visible = npcs.filter(npc => npc.x >= 0 && npc.x <= 800).length;
+  const summary = `Mô phỏng · Theo dõi ${visible} người trong sân · ${npcDrops} lượt xả rác · ${npcLitter.length} vật thể rác đang hiển thị`;
+  if ($('npcSummary').textContent !== summary) $('npcSummary').textContent = summary;
+  $('behaviorAlert').hidden = !npcLitter.length;
+  const actors = npcs.map((npc, i) => ({id: `npc${i}`, y: npc.y}));
+  actors.push({id: 'demoPerson', y: personY});
+  const layer = $('peopleLayer');
+  const ordered = actors.sort((a, b) => a.y - b.y).map(actor => $(actor.id));
+  if (ordered.some((node, i) => layer.children[i] !== node)) ordered.forEach(node => layer.appendChild(node));
+}
+
+function nearBin() {
+  return Math.hypot(personX - 666, personY + 345 - 350) <= 80;
+}
+function updateDemoResult(pickedUp = false) {
+  demoStep = npcLitter.length ? 3 : 1;
+  document.querySelectorAll('.steps li').forEach((el, i) => el.classList.toggle('active', npcLitter.length ? i > 0 : i === 0));
+  result(pickedUp ? 'Đã nhặt rác' : disposed ? 'Đã bỏ rác vào thùng' : 'Đang điều khiển nhân vật',
+    `Đang cầm ${heldWaste.length}/2 vật thể rác, mỗi tay một món. Space: nhặt rác gần nhất; nếu không có rác gần thì thả một vật đang cầm. O: bỏ toàn bộ rác đang cầm vào thùng khi đứng gần.`,
+    pickedUp ? 'Mô phỏng · Đã nhặt rác' : disposed ? 'Mô phỏng · Không cầm rác' : 'Mô phỏng · Đang cầm rác');
+  $('objectText').textContent = `Đang cầm: ${heldWaste.length}/2 · Trên sân: ${npcLitter.length}`;
+  $('confidenceText').textContent = 'Không áp dụng (mô phỏng)';
+  $('timeText').textContent = 'Thao tác bàn phím';
+}
+function syncHeldWaste() {
+  disposed = heldWaste.length === 0;
+  if (!disposed) playerWaste = heldWaste[heldWaste.length - 1];
 }
 function advanceDemo(timestamp) {
-  if (demoLastFrame !== null) demoElapsed += Math.min(timestamp - demoLastFrame, 100);
+  const delta = demoLastFrame === null ? 0 : Math.min(timestamp - demoLastFrame, 100);
+  demoElapsed += delta;
   demoLastFrame = timestamp;
+  let dx = Number(movementKeys.has('KeyD') || movementKeys.has('ArrowRight')) - Number(movementKeys.has('KeyA') || movementKeys.has('ArrowLeft'));
+  let dy = Number(movementKeys.has('KeyS') || movementKeys.has('ArrowDown')) - Number(movementKeys.has('KeyW') || movementKeys.has('ArrowUp'));
+  const length = Math.hypot(dx, dy) || 1;
+  const nextX = Math.max(35, Math.min(735, personX + dx / length * delta * 0.18));
+  const nextY = Math.max(-110, Math.min(65, personY + dy / length * delta * 0.18));
+  const blocked = npcs.some(npc => Math.abs(nextY - npc.y) < 40 && Math.abs(nextX - npc.x) < 65 &&
+    Math.hypot(nextX - npc.x, (nextY - npc.y) * 2) < Math.hypot(personX - npc.x, (personY - npc.y) * 2));
+  if (!blocked) { personX = nextX; personY = nextY; }
+  advanceNpcs(delta);
   renderDemo();
-  if (demoElapsed >= 10000) {
-    pauseDemo();
-    $('playDemo').textContent = '↻ Chạy lại demo';
-    $('statusText').textContent = 'Hoàn tất mô phỏng · Phát hiện xả rác';
-    return;
-  }
   demoTimer = requestAnimationFrame(advanceDemo);
 }
+const directionCodes = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'];
+$('demoScene').addEventListener('keydown', event => {
+  if (mode !== 'demo' || demoTimer === null || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (!directionCodes.includes(event.code) && event.code !== 'Space' && event.code !== 'KeyO') return;
+  event.preventDefault();
+  if (directionCodes.includes(event.code)) {
+    movementKeys.add(event.code);
+    return;
+  }
+  if (event.repeat) return;
+  if (event.code === 'KeyO') {
+    if (!heldWaste.length) {
+      $('statusText').textContent = 'Mô phỏng · Chưa cầm rác; đến gần rác và nhấn Space để nhặt';
+      return;
+    }
+    if (!nearBin()) {
+      $('statusText').textContent = 'Mô phỏng · Đến gần thùng rác bên phải rồi nhấn O';
+      return;
+    }
+    heldWaste = [];
+    syncHeldWaste();
+    updateDemoResult();
+  } else {
+    let nearest = -1, distance = 65;
+    npcLitter.forEach((item, i) => {
+      const d = Math.hypot(personX - item.x, personY + 345 - item.y);
+      if (d <= distance) { nearest = i; distance = d; }
+    });
+    if (nearest >= 0) {
+      if (heldWaste.length >= 2) {
+        $('statusText').textContent = 'Mô phỏng · Hai tay đã đầy (2/2). Nhấn O gần thùng để bỏ rác, hoặc ra chỗ trống và nhấn Space để thả một món';
+        return;
+      }
+      heldWaste.push(npcLitter.splice(nearest, 1)[0].type);
+      syncHeldWaste();
+      updateDemoResult(true);
+    } else if (heldWaste.length && npcLitter.length < 18) {
+      npcLitter.push({x: personX + 30, y: personY + 345, type: heldWaste.pop()});
+      syncHeldWaste();
+      updateDemoResult();
+      $('statusText').textContent = 'Mô phỏng · Đã thả rác';
+    } else {
+      $('statusText').textContent = heldWaste.length ? 'Mô phỏng · Sân đã nhiều rác; hãy nhặt bớt hoặc bỏ rác vào thùng' : 'Mô phỏng · Đến gần rác rồi nhấn Space để nhặt';
+    }
+  }
+  renderDemo();
+});
+window.addEventListener('keyup', event => movementKeys.delete(event.code));
+$('demoScene').addEventListener('blur', () => movementKeys.clear());
+window.addEventListener('blur', () => {
+  if (demoTimer !== null) {
+    pauseDemo();
+    $('playDemo').textContent = '▶ Tiếp tục';
+    $('statusText').textContent = 'Đã tạm dừng mô phỏng';
+  }
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && demoTimer !== null) {
+    pauseDemo();
+    $('playDemo').textContent = '▶ Tiếp tục';
+    $('statusText').textContent = 'Đã tạm dừng mô phỏng';
+  }
+});
 $('demoTab').addEventListener('click', () => setMode('demo'));
 $('liveTab').addEventListener('click', () => setMode('live'));
 $('playDemo').addEventListener('click', () => {
-  if (demoElapsed >= 10000) resetDemo();
   $('playDemo').disabled = true;
   $('stopDemo').disabled = false;
+  updateDemoResult();
   demoTimer = requestAnimationFrame(advanceDemo);
+  $('demoScene').focus({preventScroll: true});
 });
 $('stopDemo').addEventListener('click', () => {
   pauseDemo();
@@ -285,3 +450,6 @@ $('detailBtn').addEventListener('click', () => {
 setInterval(() => { if (stream) $('clock').textContent = now(); }, 1000);
 window.addEventListener('pagehide', () => { pauseDemo(); stopStream(); releaseImage(); });
 refreshDevices();
+
+$('controlHint').textContent = demoHint;
+resetDemo();
